@@ -42,22 +42,27 @@ class MarkovModel:
         self._is_fitted = False
         self._markov_states = ["peace", "desc", "esc", "war"]
         self._index_columns = ["country_id", "month_id"] #TODO should also support pgm level?
+        self._target = None
         self._features = []
 
         # set random forest parameters
-        # these are currently set to match the default parameters of the Ranger package in R where not already aligned
+        # these are currently set to match the default parameters of the Ranger package in R,
+        # where not already aligned with the default parameters of Sci-kit-learn
         # see https://cran.r-project.org/web/packages/ranger/ranger.pdf
         default_rf_class_params = {
             "n_estimators": 500,
             "random_state": self._random_state,
+            "n_jobs": -1
         }
         default_rf_reg_params = {
             "n_estimators": 500,
             "max_features": "sqrt",
             "min_samples_leaf": 5,
-            "random_state": self._random_state
+            "random_state": self._random_state,
+            "n_jobs": -1
         }
 
+        # update with user provided parameters
         if rf_class_params is not None:
             default_rf_class_params.update(rf_class_params)
         if rf_reg_params is not None:
@@ -65,6 +70,7 @@ class MarkovModel:
 
         self._rf_class_params = default_rf_class_params
         self._rf_reg_params = default_rf_reg_params
+
 
     def fit(
             self,
@@ -76,6 +82,7 @@ class MarkovModel:
         """
         Fit the Markov model to the provided data.
         Data must contain only the target column and feature columns, and have a multi-index with levels country_id and month_id.
+        Predictions are stored in the self._models attribute.
 
         Args:
             data (pd.DataFrame): Input data containing features and target column.
@@ -97,6 +104,7 @@ class MarkovModel:
         data = self._add_markov_states(data, target)
 
         # fit markov state model
+        self._models["state"] = {}
         if self._markov_method == "direct":
 
             # if predicting directly, fit for all steps
@@ -104,7 +112,6 @@ class MarkovModel:
                 self._fit_markov_state_model(data.copy(), step, verbose)
             
         elif self._markov_method == "transition":
-
             # if predicting using transition matrix, only fit for step = 1
             self._fit_markov_state_model(data.copy(), step = 1, verbose = verbose)
 
@@ -116,77 +123,75 @@ class MarkovModel:
 
         # set fitted flag
         self._is_fitted = True
+        self._target = target
 
 
     def predict(
             self, 
             data: pd.DataFrame,
-            target: str,
             steps: int | list[int] | range,
-            predict_type: str = "test",
-            EndOfHistory: Optional[int] = None
-        ):
+            verbose: bool = True
+        ) -> pd.DataFrame:
+        """
+        Predict the target variable for the given dataset and steps.
+        Data must contain the target column and feature columns, and have a multi-index with levels country_id and month_id.
 
-        if not self._is_fitted:
+        Args:
+            data (pd.DataFrame): The dataset for prediction.
+            steps (int | list[int] | range): Steps ahead to predict.
+            verbose (bool, optional): Whether to print progress messages. Defaults to True.
+        """
+
+        if not self._is_fitted or not self._target:
             raise ValueError("Model is not yet fitted. Cannot predict")
-        
-        # add markov states to data
-        data = self._add_markov_states(data, target=target)
-
+                
         # format steps to list
         steps_list = self._get_list_of_steps(steps)
 
-        predictions = {}
+        # check if model has been trained for given steps
+        self._check_if_steps_trained(steps_list)
 
+        # add markov states to data
+        data = self._add_markov_states(data, target=self._target)
+
+        # predict for all given steps
+        predictions = {}
         for step in steps_list:
 
+            if verbose:
+                print(f"Predicting step {step} using {self._markov_method} method." + " " * 20, flush=True, end="\r")
+
             if self._markov_method == "transition":
-                raise NotImplementedError("Transition method for steps > 1 is not yet implemented.")
-            
-                for step in steps_list:
-                    prediction_step = self._predict_transition(
-                        data.copy(),
-                        step
-                    )
-
-                    predictions[step] = prediction_step
-            
+        
+                prediction_step = self._predict_transition(
+                    data.copy(),
+                    step
+                )
+                predictions[step] = prediction_step
+        
             elif self._markov_method == "direct":
-                for step in steps_list:
-                    prediction_step = self._predict_directly(
-                        data.copy(),
-                        step
-                    )
-                    predictions[step] = prediction_step
+            
+                prediction_step = self._predict_directly(
+                    data.copy(),
+                    step
+                )
+                predictions[step] = prediction_step
 
-        combiened_predictions = pd.concat(predictions.values(), axis=0)
+        combined_predictions = pd.concat(predictions.values(), axis=0)
 
-        # TODO currently only support one step at a time
-        step = steps_list[0]
+        # pivot to wide format
+        combined_predictions = (
+            combined_predictions
+            .reset_index()
+            .pivot(index=["country_id", "target_month_id"], columns="step", values="predicted_fatalities")
+            .rename(columns=lambda x: f"predicted_fatalities_t_min_{x}")
+        )
 
-        # add target_month_id column
-        data = data.reset_index()
-        data["target_month_id"] = data.groupby("country_id")["month_id"].shift(-step)
-        data.set_index(["country_id", "month_id"], inplace=True)
+        if verbose:
+            print("\nFinished predicting for all steps.", flush=True)
 
-        # TODO should check if steps are in trained model
-        # TODO support multiple steps
-        # TODO remove target column requirement, save in fitting steps        
-
-        # filter data to test period
-        test_data = data.loc[
-            data["target_month_id"].isin(
-                range(self._test_start, self._test_end + 1))
-        ].copy()
-
-        if self._markov_method == "transition":
-            ...
-
-        elif self._markov_method == "direct":
-            ...
-
-        return self._predict_by_step(test_data, step)
-
+        return combined_predictions
+    
 
     def _fit_markov_state_model(
             self,
@@ -194,6 +199,15 @@ class MarkovModel:
             step: int,
             verbose: bool = True
         ):
+        """
+        Fit the state-prediction model for a given step.
+        Stores the fitted models in self._models["state"][step].
+
+        Args:
+            data (pd.DataFrame): The dataset.
+            step (int): The prediction step.
+            verbose (bool, optional): Whether to print progress messages. Defaults to True.
+        """
 
         # create target state by shifting markov_state by -step
         data["markov_state_target"] = data.sort_index(level="month_id").groupby(level="country_id")["markov_state"].shift(-step)
@@ -210,7 +224,6 @@ class MarkovModel:
         ].dropna().copy()
 
         # initialize dictionaries to store models
-        self._models["state"] = {}
         rf_class_models = {}
 
         for state in self._markov_states:
@@ -218,18 +231,23 @@ class MarkovModel:
             if verbose:
                 print(f"Fitting Random Forest Classifier for state: {state} and step: {step}" + " " * 20, flush=True, end="\r")
 
+            # get subset of data for current state
             state_subset = train_data[train_data["markov_state"] == state].drop(columns="markov_state").dropna()
 
+            # prepare training data
             X_train = state_subset[self._features]
             y_train = state_subset["markov_state_target"]
 
             # initialize random forest classifier
             rf_class = RandomForestClassifier(**self._rf_class_params)
 
+            # fit model
             rf_class.fit(X_train, y_train)
 
+            # store model for current state
             rf_class_models[state] = rf_class
 
+        # store all models for current step
         self._models["state"][step] = rf_class_models
 
 
@@ -239,6 +257,15 @@ class MarkovModel:
             target: str,
             verbose: bool = True
         ):
+        """
+        Fit the fatality-prediction model.
+        Stores the fitted models in self._models["fatalities"].
+
+        Args:
+            data (pd.DataFrame): The dataset.
+            target (str): The target column name. This is used to compute markov states
+            verbose (bool, optional): Whether to print progress messages. Defaults to True.
+        """
 
         # add target column
         data["fatalities_target_month"] = data.sort_index(level="month_id").groupby(level="country_id")[target].shift(-1)
@@ -280,19 +307,30 @@ class MarkovModel:
 
     def _predict_directly(
             self,
-            test_data: pd.DataFrame,
+            data: pd.DataFrame,
             step: int,
         ) -> pd.DataFrame:
         """
-        Predict the target variable for a given test dataset and step.
+        Predict the target variable for a given test dataset and step, using the direct method.
 
         Args:
-            test_data (pd.DataFrame): The test dataset.
+            data (pd.DataFrame): The dataset.
             step (int): The prediction step.
 
         Returns:
             pd.DataFrame: The predicted values.
         """
+
+        # add target_month_id column
+        data = data.reset_index()
+        data["target_month_id"] = data.groupby("country_id")["month_id"].shift(-step)
+        data.set_index(["country_id", "month_id"], inplace=True)
+
+          # filter data to test period
+        test_data = data.loc[
+            data["target_month_id"].isin(
+                range(self._test_start, self._test_end + 1))
+        ].copy().dropna()
 
         # drop non-feature columns
         X_test = test_data[self._features]
@@ -331,6 +369,7 @@ class MarkovModel:
 
         # Concatenate all start-state probability tables horizontally
         state_probabilities_df = pd.concat(state_probabilities, axis=1)
+
         # Concatenate all predicted fatalities tables horizontally
         predicted_fatalities_df = pd.concat(predicted_fatalities, axis=1)
 
@@ -339,10 +378,20 @@ class MarkovModel:
             test_data, state_probabilities_df, predicted_fatalities_df
             ], axis=1)
         
-        print(list(test_data_full.columns))
+        # ensure all required probability columns exist, if they don't, set to 0
+        # this is needed because not all states will have probabilities computed
+        # mainly a problem when predicting only one step ahead
+        for state in self._markov_states:
+            for starting_state in self._markov_states:
+                if f"p_{state}_c_{starting_state}" not in test_data_full.columns:
+                    test_data_full.loc[:, f"p_{state}_c_{starting_state}"] = 0
+
 
         # compute weighted fatalities
+        # TODO currently this is a row-wise operation, slightly slow, can be optimized later if needed
         test_data_full["predicted_fatalities"] = test_data_full.apply(self._get_weighted_fatalities, axis=1)
+        # add step as column
+        test_data_full["step"] = step
 
         # drop rows where target_month_id is NA (due to shifting)
         test_data_full = test_data_full.dropna(subset=["target_month_id"])
@@ -352,7 +401,132 @@ class MarkovModel:
             test_data_full
             .reset_index()
             .set_index(["country_id", "target_month_id"])
-            [["predicted_fatalities"]]
+            [["predicted_fatalities", "step"]]
+        )
+
+        return test_data_full
+    
+
+    def _predict_transition(
+            self,
+            data: pd.DataFrame,
+            step: int,
+        ) -> pd.DataFrame:
+        """
+        Predict the target variable for a given test dataset and step using the transition method.
+
+        Args:
+            data (pd.DataFrame): The dataset.
+            step (int): The prediction step. 
+        Returns:
+            pd.DataFrame: The predicted values.
+        """
+
+        # add target_month_id column
+        data = data.reset_index()
+        data["target_month_id"] = data.groupby("country_id")["month_id"].shift(-step)
+        data.set_index(["country_id", "month_id"], inplace=True)
+
+        # filter data to test period
+        test_data = data.loc[
+            data["target_month_id"].isin(
+                range(self._test_start, self._test_end + 1))
+        ].copy().dropna()
+
+        # drop non-feature columns
+        X_test = test_data[self._features]
+
+        # retrieve models for given step
+        state_models = self._models["state"][1]
+        fatalities_models = self._models["fatalities"]
+
+        # Initialize lists to hold results
+        state_probabilities = []
+        predicted_fatalities = []
+
+        # iterate over each possible starting state
+        for start_state in self._markov_states:
+            
+            # 1) predict probability of markov states in target month given current state
+            state_probs = state_models[start_state].predict_proba(X_test)
+            
+            # add to results
+            state_probabilities.append(
+                pd.DataFrame(state_probs, 
+                            columns=[f"p_{next}_c_{start_state}" 
+                                    for next in state_models[start_state].classes_], 
+                            index=X_test.index))
+
+            # 2) predict fatalities in target month given current state (only for esc and war)
+            if start_state in ["esc", "war"]:
+
+                # predict fatalities given start state
+                fatalities_preds = fatalities_models[start_state].predict(X_test)
+
+                # add to results
+                predicted_fatalities.append(pd.Series(fatalities_preds, 
+                                                    index=X_test.index, 
+                                                    name=f"predicted_fatalities_c_{start_state}"))
+
+        # Concatenate all start-state probability tables horizontally
+        state_probabilities_df = pd.concat(state_probabilities, axis=1)
+
+        # Concatenate all predicted fatalities tables horizontally
+        predicted_fatalities_df = pd.concat(predicted_fatalities, axis=1)
+
+        # combine results with test data
+        test_data_full = pd.concat([
+            test_data, state_probabilities_df, predicted_fatalities_df
+            ], axis=1)
+
+        # ensure all required probability columns exist, if they don't, set to 0
+        # this is needed because not all states will have probabilities computed
+        # mainly a problem when predicting only one step ahead
+        for state in self._markov_states:
+            for starting_state in self._markov_states:
+                if f"p_{state}_c_{starting_state}" not in test_data_full.columns:
+                    # print(f"Adding missing column p_{state}_c_{starting_state} with 0s")
+                    test_data_full.loc[:, f"p_{state}_c_{starting_state}"] = 0
+
+        # extract all 16 columns for the transition matrix and reshape
+        n_states = len(self._markov_states)
+        cols = [f"p_{next}_c_{current}" for current in self._markov_states for next in self._markov_states]
+
+        # reshape to 3D array: (n_samples, n_states, n_states) 
+        P = test_data_full[cols].to_numpy().reshape(-1, n_states, n_states)
+
+        # compute transition matrices to the power of step
+        P_k = self._matrix_power(P, step)
+
+        # reshape back to columns of dataframe
+        df_Pk = pd.DataFrame(
+            P_k.reshape(-1, n_states * n_states),
+            columns=cols,
+            index=test_data_full.index
+        )
+
+        # merge with test data
+        test_data_full.drop(columns=cols, inplace=True)
+        test_data_full = test_data_full.merge(
+            df_Pk,
+            left_index=True,
+            right_index=True,
+        )
+
+        # compute weighted fatalities
+        # TODO currently this is a row-wise operation, slightly slow, can be optimized later if needed
+        test_data_full["predicted_fatalities"] = test_data_full.apply(self._get_weighted_fatalities, axis=1)
+        test_data_full["step"] = step
+
+        # drop rows where target_month_id is NA (due to shifting)
+        test_data_full = test_data_full.dropna(subset=["target_month_id"])
+
+        # return results
+        test_data_full = (
+            test_data_full
+            .reset_index()
+            .set_index(["country_id", "target_month_id"])
+            [["predicted_fatalities", "step"]]
         )
 
         return test_data_full
@@ -403,6 +577,15 @@ class MarkovModel:
             data: pd.DataFrame,
             target: str
         ):
+        """
+        Verify that the data contains the required index levels and target column.
+
+        Args:
+            data (pd.DataFrame): Input data.
+            target (str): Name of the target column.
+        Raises:
+            ValueError: If the data index does not contain required levels or if the target column is missing.
+        """
 
         # verify index contains required levels
         if not all(col in data.index.names for col in self._index_columns):
@@ -411,7 +594,72 @@ class MarkovModel:
         # verify target column exists
         if target not in data.columns:
             raise ValueError(f"Target column '{target}' not found in data columns.")
+        
+
+    def _check_if_steps_trained(
+            self,
+            steps: List[int]
+        ) -> None:
+        """
+        Check if the model has been trained for the given steps.
+
+        Args:
+            steps (List[int]): Steps to check.
+        Raises:
+            ValueError: If the model has not been trained for any of the given steps.
+        """
+
+        trained_steps = self._models["state"].keys()
+
+        if self._markov_method == "direct":
+            for step in steps:
+                if step not in trained_steps:
+                    raise ValueError(f"Model has not been trained for step {step}. Please fit the model for this step before predicting.")
+                
+        if self._markov_method == "transition":
+            if 1 not in trained_steps:
+                raise ValueError("Model has not been trained for step 1 required for transition method. Please fit the model before predicting.")
+
     
+    def _get_weighted_fatalities(self, row: pd.Series) -> float:
+        """
+        Compute the weighted fatalities for a given row based on Markov state probabilities.
+        
+        Args:
+            row (pd.Series): A row of the dataframe containing probabilities and predicted fatalities.
+        Returns:
+            float: The weighted fatalities.
+        """
+
+        # set current state
+        current_state = row["markov_state"]
+
+        # weight fatalities based on markov state probabilities
+        weighted_fatalities = (
+            # predicted fatalities conditional on peace and descalation are 0, but still include for clarity
+            row[f"p_peace_c_{current_state}"] * 0 +
+            row[f"p_desc_c_{current_state}"] * 0 +
+            row[f"p_esc_c_{current_state}"] * row[f"predicted_fatalities_c_esc"] +
+            row[f"p_war_c_{current_state}"] * row[f"predicted_fatalities_c_war"]
+        )
+
+        return weighted_fatalities
+    
+
+    @staticmethod
+    def _matrix_power(transition_matrix: np.ndarray, K: int) -> np.ndarray:
+        """
+        Compute the K-th power of a batch of transition matrices.
+        Args:
+            transition_matrix (np.ndarray): A 3D array of shape (n_samples, n_states, n_states) representing the transition matrices.
+            K (int): The power to which to raise the matrices.
+        Returns:
+            np.ndarray: A 3D array of the same shape as transition_matrix, containing the K-th power of each matrix.
+        """
+        result = transition_matrix.copy()
+        for _ in range(K - 1):
+            result = np.einsum("nij,njk->nik", result, transition_matrix)
+        return result
 
     @staticmethod
     def _get_list_of_steps(
@@ -452,24 +700,6 @@ class MarkovModel:
             warnings.warn("Found steps higher than 36 months. This may lead to unreliable predictions.", UserWarning)
         
         return steps_list
-
-
-    @staticmethod
-    def _get_weighted_fatalities(row):
-
-        # set current state
-        current_state = row["markov_state"]
-        
-        # weight fatalities based on markov state probabilities
-        weighted_fatalities = (
-            # predicted fatalities conditional on peace and descalation are 0, but still include for clarity
-            row[f"p_peace_c_{current_state}"] * 0 +
-            row[f"p_desc_c_{current_state}"] * 0 +
-            row[f"p_esc_c_{current_state}"] * row[f"predicted_fatalities_c_esc"] +
-            row[f"p_war_c_{current_state}"] * row[f"predicted_fatalities_c_war"]
-        )
-
-        return weighted_fatalities
 
 
     @staticmethod
