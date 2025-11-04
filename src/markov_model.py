@@ -1,3 +1,4 @@
+import warnings
 import numpy as np
 import pandas as pd
 
@@ -12,8 +13,9 @@ class MarkovModel:
     def __init__(
             self, 
             partitioner_dict: Dict[str, Tuple[int, int]],
-            model_type: str = "both",
             markov_method: str = "direct",
+            rf_class_params: Optional[Dict] = None,
+            rf_reg_params: Optional[Dict] = None,
             random_state: Optional[int] = 42
         ):
         """
@@ -22,58 +24,97 @@ class MarkovModel:
         Args:
             partitioner_dict (Dict[str, Tuple[int, int]]): A dictionary with keys "train" and "test", 
                 each mapping to a tuple of (start_month_id, end_month_id) for the respective data partitions.
-            model_type (str, optional): Type of model to use for the regression step. Options are: 
-                - "rf" for a Random Forest Regression model;
-                - "glm" for Generalized Linear Model; 
-                - or "both" for both models. Defaults to "both".
             markov_method (str, optional): Forecasting method to use. Options are "direct" or "transition". 
                 When "direct", the model predicts the markov state of the target month directly for any step size.
                 When "transition", the model computes the transition matrix between states and uses it to forecast multiple steps ahead.
                 Defaults to "direct".
+            rf_class_params (Optional[Dict], optional): Parameters for Random Forest Classifier. Defaults to None.
+            rf_reg_params (Optional[Dict], optional): Parameters for Random Forest Regressor. Defaults to None.
             random_state (Optional[int], optional): Random state for reproducibility. Defaults to 42.
         """
 
         self._train_start, self._train_end = partitioner_dict["train"]
         self._test_start, self._test_end = partitioner_dict["test"]
-        self._model_type = model_type
         self._markov_method = markov_method
 
         self._random_state = random_state
         self._models = {}
         self._is_fitted = False
         self._markov_states = ["peace", "desc", "esc", "war"]
+        self._index_columns = ["country_id", "month_id"] #TODO should also support pgm level?
+        self._features = []
 
+        # set random forest parameters
+        # these are currently set to match the default parameters of the Ranger package in R where not already aligned
+        # see https://cran.r-project.org/web/packages/ranger/ranger.pdf
+        default_rf_class_params = {
+            "n_estimators": 500,
+            "random_state": self._random_state,
+        }
+        default_rf_reg_params = {
+            "n_estimators": 500,
+            "max_features": "sqrt",
+            "min_samples_leaf": 5,
+            "random_state": self._random_state
+        }
+
+        if rf_class_params is not None:
+            default_rf_class_params.update(rf_class_params)
+        if rf_reg_params is not None:
+            default_rf_reg_params.update(rf_reg_params)
+
+        self._rf_class_params = default_rf_class_params
+        self._rf_reg_params = default_rf_reg_params
 
     def fit(
             self,
             data: pd.DataFrame,
-            step: int,
+            steps: int | list[int] | range,
             target: str,
             verbose: bool = True
-        ):
+        ) -> None:
+        """
+        Fit the Markov model to the provided data.
+        Data must contain only the target column and feature columns, and have a multi-index with levels country_id and month_id.
 
-        # TODO verify that data contains correct index
-        # TODO force index levels to be month_id, country_id
-        # TODO verify that data contains target column, and that target is non-negative integer
+        Args:
+            data (pd.DataFrame): Input data containing features and target column.
+            steps (int | list[int] | range): Steps ahead to fit the model for.
+            target (str): Name of the target column in the data.
+            verbose (bool, optional): Whether to print progress messages. Defaults to True.
+        """
+
+        # verify input data
+        self._verify_input_data(data, target)
+
+        # format steps to list
+        steps_list = self._get_list_of_steps(steps)
+
+        # set features
+        self._features = data.columns.drop(target).tolist()
 
         # add markov states to data
         data = self._add_markov_states(data, target)
 
-        # filter data to training period
-        train_data = data.loc[
-            data.index.get_level_values("month_id").isin(
-                range(self._train_start, self._train_end + 1))
-        ].copy()
-
         # fit markov state model
+        if self._markov_method == "direct":
 
-        # TODO support multiple steps
-        # TODO distinguish between markov_method options
-        # TODO add options for model_type argument
+            # if predicting directly, fit for all steps
+            for step in steps_list:
+                self._fit_markov_state_model(data.copy(), step, verbose)
+            
+        elif self._markov_method == "transition":
 
-        self._fit_markov_state_model(train_data.copy(), step, verbose)
-        self._fit_fatality_model(train_data.copy(), step, target, verbose)
+            # if predicting using transition matrix, only fit for step = 1
+            self._fit_markov_state_model(data.copy(), step = 1, verbose = verbose)
 
+        if verbose:
+            print("\nFinished fitting Random Forest Classifiers for all Markov states.", flush=True)
+
+        # fit fatality model
+        self._fit_fatality_model(data.copy(), target, verbose)
+
+        # set fitted flag
         self._is_fitted = True
 
 
@@ -81,73 +122,109 @@ class MarkovModel:
             self, 
             data: pd.DataFrame,
             target: str,
-            step: int,
-            predict_type: str,
+            steps: int | list[int] | range,
+            predict_type: str = "test",
             EndOfHistory: Optional[int] = None
         ):
 
         if not self._is_fitted:
             raise ValueError("Model is not yet fitted. Cannot predict")
         
-        # predict_type should be one of "train", "calibration", "future"
-        if predict_type not in ["calibration", "future"]:
-            ...
-
-        if predict_type == "future" and EndOfHistory is None:
-            raise ValueError("EndOfHistory must be provided for future predictions")
-
-        # TODO should check if steps are in trained model
-        # TODO support multiple steps
-        # TODO remove target column requirement, save in fitting step
-
         # add markov states to data
         data = self._add_markov_states(data, target=target)
 
+        # format steps to list
+        steps_list = self._get_list_of_steps(steps)
+
+        predictions = {}
+
+        for step in steps_list:
+
+            if self._markov_method == "transition":
+                raise NotImplementedError("Transition method for steps > 1 is not yet implemented.")
+            
+                for step in steps_list:
+                    prediction_step = self._predict_transition(
+                        data.copy(),
+                        step
+                    )
+
+                    predictions[step] = prediction_step
+            
+            elif self._markov_method == "direct":
+                for step in steps_list:
+                    prediction_step = self._predict_directly(
+                        data.copy(),
+                        step
+                    )
+                    predictions[step] = prediction_step
+
+        combiened_predictions = pd.concat(predictions.values(), axis=0)
+
+        # TODO currently only support one step at a time
+        step = steps_list[0]
+
+        # add target_month_id column
+        data = data.reset_index()
+        data["target_month_id"] = data.groupby("country_id")["month_id"].shift(-step)
+        data.set_index(["country_id", "month_id"], inplace=True)
+
+        # TODO should check if steps are in trained model
+        # TODO support multiple steps
+        # TODO remove target column requirement, save in fitting steps        
+
         # filter data to test period
         test_data = data.loc[
-            data.index.get_level_values("month_id").isin(
+            data["target_month_id"].isin(
                 range(self._test_start, self._test_end + 1))
         ].copy()
 
-        # add target_month_id column
-        test_data = test_data.reset_index()
-        test_data["target_month_id"] = test_data.groupby("country_id")["month_id"].shift(-step)
-        test_data.set_index(["country_id", "month_id"], inplace=True)
+        if self._markov_method == "transition":
+            ...
+
+        elif self._markov_method == "direct":
+            ...
 
         return self._predict_by_step(test_data, step)
 
 
     def _fit_markov_state_model(
             self,
-            train_data: pd.DataFrame,
+            data: pd.DataFrame,
             step: int,
             verbose: bool = True
         ):
 
-        # set target markov state
-        target_state_col = f"markov_state_t_plus_{step}"
+        # create target state by shifting markov_state by -step
+        data["markov_state_target"] = data.sort_index(level="month_id").groupby(level="country_id")["markov_state"].shift(-step)
 
-        # create target column by shifting markov_state by -step
-        train_data[target_state_col] = train_data.groupby(level=1)["markov_state"].shift(-step)
+        # add target_month_id column
+        data = data.reset_index()
+        data["target_month_id"] = data["month_id"] + step
+        data.set_index(["country_id", "month_id"], inplace=True)
 
+        # filter data to training period
+        train_data = data.loc[
+            data["target_month_id"].isin(
+                range(self._train_start, self._train_end + 1))
+        ].dropna().copy()
+
+        # initialize dictionaries to store models
         self._models["state"] = {}
         rf_class_models = {}
 
         for state in self._markov_states:
 
             if verbose:
-                print(f"Fitting Random Forest Classifier for state: {state}" + " " * 20, flush=True, end="\r")
+                print(f"Fitting Random Forest Classifier for state: {state} and step: {step}" + " " * 20, flush=True, end="\r")
 
             state_subset = train_data[train_data["markov_state"] == state].drop(columns="markov_state").dropna()
 
-            X_train = state_subset.drop(columns=target_state_col)
-            y_train = state_subset[target_state_col]
+            X_train = state_subset[self._features]
+            y_train = state_subset["markov_state_target"]
 
-            rf_class = RandomForestClassifier(
-                n_estimators = 200,                #TODO make configurable
-                random_state = self._random_state,
-                class_weight = 'balanced',
-            )
+            # initialize random forest classifier
+            rf_class = RandomForestClassifier(**self._rf_class_params)
 
             rf_class.fit(X_train, y_train)
 
@@ -155,25 +232,28 @@ class MarkovModel:
 
         self._models["state"][step] = rf_class_models
 
-        if verbose:
-            print("\nFinished fitting Random Forest Classifiers for all Markov states.", flush=True)
-
 
     def _fit_fatality_model(
             self,
-            train_data: pd.DataFrame,
-            step: int,
+            data: pd.DataFrame,
             target: str,
             verbose: bool = True
         ):
 
-        # set target column
-        target_column = f"fatalities_t_plus_{step}"
-
         # add target column
-        train_data[target_column] = train_data.groupby(level=1)[target].shift(-step)
+        data["fatalities_target_month"] = data.sort_index(level="month_id").groupby(level="country_id")[target].shift(-1)
+   
+        # add target_month_id column
+        data = data.reset_index()
+        data["target_month_id"] = data["month_id"] + 1
+        data.set_index(["country_id", "month_id"], inplace=True)
 
-        self._models["fatalities"] = {}
+        # filter data to training period
+        train_data = data.loc[
+            data["target_month_id"].isin(
+                range(self._train_start, self._train_end + 1))
+        ].drop(columns="target_month_id").dropna().copy()
+
         rf_reg_models = {}
 
         for state in ["esc", "war"]:
@@ -181,27 +261,24 @@ class MarkovModel:
             if verbose:
                 print(f"Fitting Random Forest Regressor for state: {state}" + " " * 20, flush=True, end="\r")
 
-            state_subset = train_data[train_data["markov_state"] == state].drop(columns="markov_state").dropna()
+            state_subset = train_data[train_data["markov_state"] == state].dropna()
 
-            X_train = state_subset.drop(columns=target_column)
-            y_train = state_subset[target_column]
+            X_train = state_subset[self._features]
+            y_train = state_subset["fatalities_target_month"]
 
-            rf_reg = RandomForestRegressor(
-                n_estimators=200,
-                random_state=self._random_state,
-            )
+            rf_reg = RandomForestRegressor(**self._rf_reg_params)
 
             rf_reg.fit(X_train, y_train)
 
             rf_reg_models[state] = rf_reg
 
-        self._models["fatalities"][step] = rf_reg_models
+        self._models["fatalities"] = rf_reg_models
 
         if verbose:
             print("\nFinished fitting Random Forest Regressors for all Markov states.", flush=True)
 
 
-    def _predict_by_step(
+    def _predict_directly(
             self,
             test_data: pd.DataFrame,
             step: int,
@@ -218,11 +295,11 @@ class MarkovModel:
         """
 
         # drop non-feature columns
-        X_test = test_data.drop(columns=["markov_state", "target_month_id"])
+        X_test = test_data[self._features]
 
         # retrieve models for given step
         state_models = self._models["state"][step]
-        fatalities_models = self._models["fatalities"][step]
+        fatalities_models = self._models["fatalities"]
 
         # Initialize lists to hold results
         state_probabilities = []
@@ -261,6 +338,8 @@ class MarkovModel:
         test_data_full = pd.concat([
             test_data, state_probabilities_df, predicted_fatalities_df
             ], axis=1)
+        
+        print(list(test_data_full.columns))
 
         # compute weighted fatalities
         test_data_full["predicted_fatalities"] = test_data_full.apply(self._get_weighted_fatalities, axis=1)
@@ -298,10 +377,10 @@ class MarkovModel:
             pd.DataFrame: Data with an additional 'markov_state' column.
         """
 
-        data = data.sort_index(level=[1, 0])  # sort by country_id, month_id
+        data = data.sort_index(level=["country_id", "month_id"])  # sort by country_id, month_id
 
         # compute temporary t-1 of target
-        data[f"{target}_t_min_1"] = data.groupby(level=1)[target].shift(1)
+        data[f"{target}_t_min_1"] = data.groupby(level="country_id")[target].shift(1)
 
         # compute markov states
         data["markov_state"] = data.apply(
@@ -317,6 +396,62 @@ class MarkovModel:
         data.drop(columns=[f"{target}_t_min_1"], inplace=True)
 
         return data
+    
+
+    def _verify_input_data(
+            self,
+            data: pd.DataFrame,
+            target: str
+        ):
+
+        # verify index contains required levels
+        if not all(col in data.index.names for col in self._index_columns):
+            raise ValueError(f"Data index must contain the following levels: {self._index_columns}. Current index levels are: {data.index.names}")
+
+        # verify target column exists
+        if target not in data.columns:
+            raise ValueError(f"Target column '{target}' not found in data columns.")
+    
+
+    @staticmethod
+    def _get_list_of_steps(
+            steps: int | list[int] | range,
+        ) -> List[int]:
+        """
+        Formats a given steps input into a list of positive integers.
+
+        Args:
+            steps (int | list[int] | range): Steps ahead to format.
+        Returns:
+            List[int]: A list of positive integers representing the steps.
+        Raises:
+            TypeError: If steps is not an int, list of ints, or range.
+            ValueError: If any step is not a positive integer.
+            UserWarning: If any step is greater than 36.
+        """
+    
+        # format steps to list
+        if isinstance(steps, range):
+            steps_list = list(steps)
+        elif isinstance(steps, list):
+            steps_list = steps
+        elif isinstance(steps, int):
+            steps_list = [steps]
+        else:
+            raise TypeError("Steps must be an int, list of ints, or range.")
+
+        for s in steps_list:
+            if not isinstance(s, int):
+                raise TypeError(f"All elements in steps list must be integers. {s} is of type {type(s)}")
+            
+        # check that all steps are positive integers
+        if any(s <= 0 for s in steps_list):
+            raise ValueError("All steps must be positive integers.")
+        # raise warning if steps are above 36
+        if any(s > 36 for s in steps_list):
+            warnings.warn("Found steps higher than 36 months. This may lead to unreliable predictions.", UserWarning)
+        
+        return steps_list
 
 
     @staticmethod
